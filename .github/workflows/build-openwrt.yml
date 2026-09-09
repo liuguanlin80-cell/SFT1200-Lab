@@ -94,6 +94,21 @@ jobs:
           luci['feeds'] = []
           luci_path.write_text(yaml.safe_dump(luci, sort_keys=False))
           print('Pinned gl_feed_common to SDK-era revision:', common[0]['revision'])
+
+          # The SDK downloads QCA99X0 board data even when its package is disabled.
+          # Register this download only for builds selecting a QCA99X0 package.
+          qca_path = Path('package/firmware/linux-firmware/qca_ath10k.mk')
+          qca_text = qca_path.read_text()
+          download_rule = '$(eval $(call Download,qca99x0-board))'
+          assert qca_text.count(download_rule) == 1, 'Unexpected QCA99X0 download rule'
+          guarded_rule = (
+              'ifneq ($(filter y m,$(CONFIG_PACKAGE_ath10k-firmware-qca99x0) '
+              '$(CONFIG_PACKAGE_ath10k-firmware-qca99x0-ct)),)\n'
+              + download_rule + '\nendif'
+          )
+          qca_path.write_text(qca_text.replace(download_rule, guarded_rule, 1))
+          Path(os.environ['LOG_DIR'], 'qca_ath10k-patched.mk').write_text(qca_path.read_text())
+          print('QCA99X0 board download now depends on package selection.')
           PY
           python3 scripts/gen_config.py target_siflower_gl-sft1200 luci
           test -f Makefile
