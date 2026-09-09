@@ -1,240 +1,167 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
-
 name: Build OpenWrt
 
 on:
-  repository_dispatch:
   workflow_dispatch:
-    inputs:
-      ssh:
-        description: 'SSH connection to Actions'
-        required: false
-        default: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sft1200-build-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  REPO_URL: https://github.com/201821143044/gl-infra-builder-new
-  REPO_BRANCH: main
-  FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: true
-  UPLOAD_FIRMWARE: false
-  UPLOAD_COWTRANSFER: false
-  UPLOAD_WETRANSFER: false
-  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
+  BUILDER_URL: https://github.com/201821143044/gl-infra-builder-new.git
+  BUILDER_COMMIT: bcf28a4224d1f3345e65d22272c8c198b24bb5ab
+  OPENWRT_DIR: ${{ github.workspace }}/builder/openwrt-18.06/siflower/openwrt-18.06
+  LOG_DIR: ${{ github.workspace }}/build-logs
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-
+    timeout-minutes: 360
     steps:
-    - name: Before freeing up disk space
-      run: |
-        echo "Before freeing up disk space"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-    - name: "Optimize Disk Space"
-      uses: "hugoalh/disk-space-optimizer-ghaction@v0.8.1"
-      with:
-        operate_sudo: "True"
-        general_include: ".+"
-        general_exclude: |-
-          ^GCC$
-          ^G\+\+$
-          Clang
-          LLVM
-        docker_include: ".+"
-        docker_prune: "True"
-        docker_clean: "True"
-        apt_prune: "True"
-        apt_clean: "True"
-        homebrew_prune: "True"
-        homebrew_clean: "True"
-        npm_prune: "True"
-        npm_clean: "True"
-        os_swap: "True"
+      - name: Prepare build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOG_DIR"
+          exec > >(tee "$LOG_DIR/environment.log") 2>&1
+          df -h
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            file flex g++-multilib gawk gcc-multilib gettext git gperf \
+            help2man intltool libelf-dev libglib2.0-dev libgmp-dev \
+            libltdl-dev libmpc-dev libmpfr-dev libncurses-dev \
+            libreadline-dev libssl-dev libtool lzma ninja-build patch \
+            perl pkgconf python2.7 python3 python3-dev python3-pyelftools \
+            python3-setuptools python3-yaml rsync sharutils subversion \
+            swig texinfo time unzip wget xsltproc xxd xz-utils \
+            zlib1g-dev zstd
+          sudo apt-get clean
+          git config --global user.name 'SFT1200 Build'
+          git config --global user.email 'sft1200-build@localhost'
+          git rev-parse HEAD > "$LOG_DIR/repository-commit.txt"
+          df -h
 
-    - name: Freeing up disk space
-      uses: wekingchen/maximize-build-space@master
-      with: 
-        root-reserve-mb: 2048
-        swap-size-mb: 1
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-        remove-codeql: 'true'
-        remove-docker-images: 'true'
+      - name: Prepare SFT1200 SDK
+        run: |
+          set -euo pipefail
+          exec > >(tee "$LOG_DIR/sdk.log") 2>&1
+          git init builder
+          git -C builder remote add origin "$BUILDER_URL"
+          git -C builder fetch --depth 1 origin "$BUILDER_COMMIT"
+          git -C builder checkout --detach FETCH_HEAD
+          git -C builder rev-parse HEAD > "$LOG_DIR/builder-commit.txt"
+          cd builder
+          python3 setup.py -c configs/config-siflower-18.x.yml
+          cd "$OPENWRT_DIR"
+          python3 scripts/gen_config.py target_siflower_gl-sft1200 luci
+          test -f Makefile
 
-    - name: Free up disk space complete
-      run: |
-        echo "Free up disk space complete"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
+      - name: Configure feeds
+        run: |
+          set -euo pipefail
+          exec > >(tee "$LOG_DIR/feeds.log") 2>&1
+          cd "$OPENWRT_DIR"
+          if [ -f "$GITHUB_WORKSPACE/feeds.conf.default" ]; then
+            cp "$GITHUB_WORKSPACE/feeds.conf.default" feeds.conf.default
+          fi
+          bash -e "$GITHUB_WORKSPACE/diy-part1.sh"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
-    - name: Checkout
-      uses: actions/checkout@main
+      - name: Apply firmware configuration
+        run: |
+          set -euo pipefail
+          exec > >(tee "$LOG_DIR/configuration.log") 2>&1
+          cd "$OPENWRT_DIR"
+          if [ -d "$GITHUB_WORKSPACE/files" ]; then
+            mkdir -p files
+            cp -a "$GITHUB_WORKSPACE/files/." files/
+          fi
+          cp "$GITHUB_WORKSPACE/.config" .config
+          bash -e "$GITHUB_WORKSPACE/diy-part2.sh"
+          make defconfig
+          for option in \
+            CONFIG_TARGET_siflower_sf19a28_fullmask_SF19A28-GL-SFT1200 \
+            CONFIG_PACKAGE_ua2f \
+            CONFIG_PACKAGE_kmod-rkp-ipid; do
+            if ! grep -qx "${option}=y" .config; then
+              echo "::error::Required option missing: ${option}=y. Finish the firmware customization before building."
+              exit 1
+            fi
+          done
+          cp .config "$LOG_DIR/build.config"
+          ./scripts/diffconfig.sh > "$LOG_DIR/diffconfig.txt"
+          cp feeds.conf.default "$LOG_DIR/feeds.conf.default"
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo rm -rf /etc/apt/sources.list.d* /usr/local/lib/android* /etc/docker* /etc/firefox* /etc/mysql* /etc/php* /opt/google* /usr/share/dotnet* /usr/share/google* /usr/share/moby* /usr/share/mysql* /usr/share/php*
-        sudo -E apt-get -qq update
-        sudo add-apt-repository universe
-        sudo apt-get update
-        sudo -E apt-get -qq install $(curl -fsSL raw.githubusercontent.com/wekingchen/my-file/master/depends-ubuntuLTS)
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-        sudo chown $USER:$GROUPS $GITHUB_WORKSPACE
+      - name: Download source packages
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+          make download -j8 V=s 2>&1 | tee "$LOG_DIR/download.log"
 
-    - name: Clone source code
-      working-directory: ./
-      run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /openwrt $GITHUB_WORKSPACE/openwrt
-        cd openwrt
-        git config --global user.email "you@example.com"
-        git config --global user.name "Your Name"
-        python3 setup.py -c ./configs/config-siflower-18.x.yml && cd openwrt-18.06/siflower/openwrt-18.06        
-        ./scripts/gen_config.py target_siflower_gl-sft1200 luci
+      - name: Compile firmware
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+          if ! make -j"$(nproc)" V=s 2>&1 | tee "$LOG_DIR/build.log"; then
+            echo 'Parallel build failed; retrying with one job for a clearer error.'
+            make -j1 V=s 2>&1 | tee "$LOG_DIR/build-single-job.log"
+          fi
 
-    - name: Load custom feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/openwrt-18.06/siflower/openwrt-18.06/feeds.conf.default
-        chmod +x $DIY_P1_SH
-        cd openwrt/openwrt-18.06/siflower/openwrt-18.06
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+      - name: Check firmware output
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR/bin/targets"
+          find . -type f \( -name '*.tar' -o -name '*.img' -o -name '*.bin' \) \
+            -print > "$LOG_DIR/firmware-files.txt"
+          test -s "$LOG_DIR/firmware-files.txt"
+          find . -type f \( -name '*.tar' -o -name '*.img' -o -name '*.bin' \) \
+            -print0 | sort -z | xargs -0 -r sha256sum > "$LOG_DIR/firmware-sha256.txt"
+          cp "$LOG_DIR/firmware-sha256.txt" SFT1200-Lab-sha256.txt
 
-    - name: Update feeds
-      run: cd openwrt/openwrt-18.06/siflower/openwrt-18.06 && ./scripts/feeds update -a
+      - name: Upload firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: SFT1200-firmware-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ env.OPENWRT_DIR }}/bin/targets/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
-    - name: Install feeds
-      run: cd openwrt/openwrt-18.06/siflower/openwrt-18.06 && ./scripts/feeds install -a
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          mkdir -p "$LOG_DIR"
+          df -h > "$LOG_DIR/disk-space.txt"
+          if [ -f "$OPENWRT_DIR/.config" ]; then
+            cp "$OPENWRT_DIR/.config" "$LOG_DIR/build.config"
+          fi
+          if [ -d "$OPENWRT_DIR/logs" ]; then
+            cp -a "$OPENWRT_DIR/logs" "$LOG_DIR/openwrt-logs"
+          fi
 
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/openwrt-18.06/siflower/openwrt-18.06/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/openwrt-18.06/siflower/openwrt-18.06/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt/openwrt-18.06/siflower/openwrt-18.06
-        $GITHUB_WORKSPACE/$DIY_P2_SH
-
-    - name: SSH connection to Actions
-      uses: P3TERX/ssh2actions@v1.0.0
-      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
-      env:
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-
-    - name: Download package
-      id: package
-      run: |
-        cd openwrt/openwrt-18.06/siflower/openwrt-18.06
-        make download -j8
-        
-    - name: Compile the firmware
-      id: compile
-      run: |
-        cd openwrt/openwrt-18.06/siflower/openwrt-18.06
-        echo -e "$(nproc) thread compile"    
-        make -j$(nproc) V=s
-        # make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
-
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
-
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/openwrt-18.06/siflower/openwrt-18.06/bin
-
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        cd openwrt/openwrt-18.06/siflower/openwrt-18.06/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
-
-    - name: Upload firmware to cowtransfer
-      id: cowtransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
-        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
-        echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
-
-    - name: Upload firmware to WeTransfer
-      id: wetransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
-        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
-        echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
-
-    - name: Generate release tag
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
-        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@v3
-      if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: /home/runner/work/Actions-SFT1200/Actions-SFT1200/openwrt/openwrt-18.06/siflower/openwrt-18.06/bin/targets/siflower/openwrt-*squashfs*
-
-    - name: Delete workflow runs
-      uses: wekingchen/delete-workflow-runs@main
-      with:
-        retain_days: 30
-        keep_minimum_runs: 10
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.3.4
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 10
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: SFT1200-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ env.LOG_DIR }}/
+          if-no-files-found: warn
+          retention-days: 14
