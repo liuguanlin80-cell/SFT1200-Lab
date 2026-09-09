@@ -70,6 +70,31 @@ jobs:
           cd builder
           python3 setup.py -c configs/config-siflower-18.x.yml
           cd "$OPENWRT_DIR"
+          # Pin the moving vendor feed BEFORE gen_config.py installs packages.
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import yaml
+
+          profile_path = Path('profiles/target_siflower_gl-sft1200.yml')
+          original = profile_path.read_text()
+          profile = yaml.safe_load(original)
+          common = [f for f in profile['feeds'] if f['name'] == 'gl_feed_common']
+          assert len(common) == 1, 'Expected exactly one gl_feed_common entry'
+          assert common[0]['uri'] == 'https://github.com/gl-inet/gl-feeds.git'
+          common[0].pop('branch', None)
+          common[0]['revision'] = '99b45c5e0d791a017267888b907d9e1dacdeb9c5'
+          Path(os.environ['LOG_DIR'], 'sft1200-profile-original.yml').write_text(original)
+          profile_path.write_text(yaml.safe_dump(profile, sort_keys=False))
+
+          # This builder fork has no feeds/glinet directory. Use SDK LuCI feeds.
+          luci_path = Path('profiles/luci.yml')
+          luci = yaml.safe_load(luci_path.read_text())
+          assert luci.get('feeds') == [{'name': 'glinet', 'path': '../feeds_dir/glinet'}]
+          luci['feeds'] = []
+          luci_path.write_text(yaml.safe_dump(luci, sort_keys=False))
+          print('Pinned gl_feed_common to SDK-era revision:', common[0]['revision'])
+          PY
           python3 scripts/gen_config.py target_siflower_gl-sft1200 luci
           test -f Makefile
 
