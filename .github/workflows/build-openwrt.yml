@@ -16,6 +16,9 @@ env:
   BUILDER_COMMIT: bcf28a4224d1f3345e65d22272c8c198b24bb5ab
   OPENWRT_DIR: ${{ github.workspace }}/builder/openwrt-18.06/siflower/openwrt-18.06
   LOG_DIR: ${{ github.workspace }}/build-logs
+  CCACHE_DIR: ${{ github.workspace }}/.sft1200-ccache
+  CCACHE_MAXSIZE: 2G
+  CCACHE_COMPILERCHECK: content
 
 defaults:
   run:
@@ -109,6 +112,27 @@ jobs:
           qca_path.write_text(qca_text.replace(download_rule, guarded_rule, 1))
           Path(os.environ['LOG_DIR'], 'qca_ath10k-patched.mk').write_text(qca_path.read_text())
           print('QCA99X0 board download now depends on package selection.')
+
+          # UA2F needs the IPv6 TCP mangler exported by libnetfilter_queue 1.0.5.
+          nfq_path = Path('package/libs/libnetfilter-queue/Makefile')
+          nfq_text = nfq_path.read_text()
+          old_source = '''PKG_SOURCE_PROTO:=git
+          PKG_SOURCE_URL=https://git.netfilter.org/libnetfilter_queue
+          PKG_SOURCE_DATE:=2017-06-27
+          PKG_SOURCE_VERSION:=601abd1c71ccdf90753cf294c120ad43fb25dc54
+          PKG_MIRROR_HASH:=283b99cfe5856dc87fd6bab8f78c0c59b72462d6b4f2b13111f928cf33020eb3'''
+          new_source = '''PKG_VERSION:=1.0.5
+          PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.bz2
+          PKG_SOURCE_URL:=https://www.netfilter.org/projects/libnetfilter_queue/files/
+          PKG_HASH:=f9ff3c11305d6e03d81405957bdc11aea18e0d315c3e3f48da53a24ba251b9f5'''
+          assert nfq_text.count(old_source) == 1, 'Unexpected libnetfilter-queue source definition'
+          nfq_path.write_text(nfq_text.replace(old_source, new_source, 1))
+          # The old checksum patch is already included in the 1.0.5 release.
+          checksum_patch = nfq_path.parent / 'patches/100-checksum_computation.patch'
+          assert checksum_patch.is_file(), 'Expected SDK checksum patch is missing'
+          checksum_patch.rename(Path(os.environ['LOG_DIR']) / 'libnetfilter-queue-retired-checksum.patch')
+          Path(os.environ['LOG_DIR'], 'libnetfilter-queue-Makefile').write_text(nfq_path.read_text())
+          print('Selected libnetfilter_queue 1.0.5 with verified source SHA256.')
           PY
           python3 scripts/gen_config.py target_siflower_gl-sft1200 luci
           test -f Makefile
@@ -136,7 +160,10 @@ jobs:
           fi
           cp "$GITHUB_WORKSPACE/.config" .config
           bash -e "$GITHUB_WORKSPACE/diy-part2.sh"
+          sed -i '/^CONFIG_CCACHE=/d; /^# CONFIG_CCACHE is not set$/d' .config
+          echo 'CONFIG_CCACHE=y' >> .config
           make defconfig
+          grep -qx 'CONFIG_CCACHE=y' .config
           for option in \
             CONFIG_TARGET_siflower_sf19a28_fullmask_SF19A28-GL-SFT1200 \
             CONFIG_PACKAGE_ua2f \
@@ -149,6 +176,18 @@ jobs:
           cp .config "$LOG_DIR/build.config"
           ./scripts/diffconfig.sh > "$LOG_DIR/diffconfig.txt"
           cp feeds.conf.default "$LOG_DIR/feeds.conf.default"
+
+      - name: Restore source and compiler caches
+        id: build-cache
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ${{ env.OPENWRT_DIR }}/dl
+            ${{ env.CCACHE_DIR }}
+          key: sft1200-ubuntu2204-cache-v1-${{ env.BUILDER_COMMIT }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sft1200-ubuntu2204-cache-v1-${{ env.BUILDER_COMMIT }}-
 
       - name: Download source packages
         run: |
@@ -196,6 +235,19 @@ jobs:
           if [ -d "$OPENWRT_DIR/logs" ]; then
             cp -a "$OPENWRT_DIR/logs" "$LOG_DIR/openwrt-logs"
           fi
+          if [ -x "$OPENWRT_DIR/staging_dir/host/bin/ccache" ]; then
+            "$OPENWRT_DIR/staging_dir/host/bin/ccache" -s > "$LOG_DIR/ccache-stats.txt"
+          fi
+
+      - name: Save caches even after a build failure
+        if: always() && steps.build-cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ${{ env.OPENWRT_DIR }}/dl
+            ${{ env.CCACHE_DIR }}
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
 
       - name: Upload diagnostics
         if: always()
