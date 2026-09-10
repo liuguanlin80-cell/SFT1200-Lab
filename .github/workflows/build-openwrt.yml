@@ -133,6 +133,26 @@ jobs:
           checksum_patch.rename(Path(os.environ['LOG_DIR']) / 'libnetfilter-queue-retired-checksum.patch')
           Path(os.environ['LOG_DIR'], 'libnetfilter-queue-Makefile').write_text(nfq_path.read_text())
           print('Selected libnetfilter_queue 1.0.5 with verified source SHA256.')
+
+          # CMake must identify the real C/C++ compilers; ccache is a launcher.
+          cmake_path = Path('include/cmake.mk')
+          cmake_text = cmake_path.read_text()
+          old_ccache = '''  CCACHE:=$(STAGING_DIR_HOST)/bin/ccache
+            CMAKE_C_COMPILER:=$(CCACHE)
+            CMAKE_C_COMPILER_ARG1:=$(TARGET_CC_NOCACHE)
+            CMAKE_CXX_COMPILER:=$(CCACHE)
+            CMAKE_CXX_COMPILER_ARG1:=$(TARGET_CXX_NOCACHE)'''
+          new_ccache = '''  CCACHE:=$(STAGING_DIR_HOST)/bin/ccache
+            CMAKE_C_COMPILER:=$(call cmake_tool,$(TARGET_CC_NOCACHE))
+            CMAKE_C_COMPILER_ARG1:=
+            CMAKE_CXX_COMPILER:=$(call cmake_tool,$(TARGET_CXX_NOCACHE))
+            CMAKE_CXX_COMPILER_ARG1:=
+            CMAKE_OPTIONS += -DCMAKE_C_COMPILER_LAUNCHER=$(CCACHE)
+            CMAKE_OPTIONS += -DCMAKE_CXX_COMPILER_LAUNCHER=$(CCACHE)'''
+          assert cmake_text.count(old_ccache) == 1, 'Unexpected SDK CMake ccache block'
+          cmake_path.write_text(cmake_text.replace(old_ccache, new_ccache, 1))
+          Path(os.environ['LOG_DIR'], 'cmake-patched.mk').write_text(cmake_path.read_text())
+          print('CMake ccache integration now uses real compilers with cache launchers.')
           PY
           python3 scripts/gen_config.py target_siflower_gl-sft1200 luci
           test -f Makefile
